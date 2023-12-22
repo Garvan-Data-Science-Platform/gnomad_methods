@@ -1038,6 +1038,8 @@ def compute_coverage_stats(
         if "END" in mtds.entry:
             # Densify
             mt = hl.experimental.densify(mtds)
+        else:
+            mt = mtds
 
     # Filter rows where the reference is missing
     mt = mt.filter_rows(mt._in_ref)
