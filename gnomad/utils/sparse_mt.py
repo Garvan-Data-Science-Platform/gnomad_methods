@@ -1041,6 +1041,8 @@ def compute_coverage_stats(
         else:
             mt = mtds
 
+    logger.info("Joined with Ref")
+
     # Filter rows where the reference is missing
     mt = mt.filter_rows(mt._in_ref)
 
@@ -1051,6 +1053,8 @@ def compute_coverage_stats(
     mt = mt.annotate_cols(
         group_membership=group_membership_ht[mt.col_key].group_membership
     )
+
+    logger.info("About to start coverage stats compute")
 
     # Compute coverage stats
     coverage_over_x_bins = sorted(coverage_over_x_bins)
@@ -1147,6 +1151,7 @@ def compute_coverage_stats(
                 group_membership_ht.index_globals().freq_meta_sample_count
             ),
         )
+    logger.info("Made it to the end")
 
     return ht
 
