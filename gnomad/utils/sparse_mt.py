@@ -1081,7 +1081,7 @@ def compute_coverage_stats(
             mt.group_membership,
         )
     ).rows()
-    ht = ht.checkpoint(hl.utils.new_temp_file("coverage_stats", "ht"))
+    # ht = ht.checkpoint(hl.utils.new_temp_file("coverage_stats", "ht"))
 
     # This expression aggregates the DP counter in reverse order of the
     # coverage_over_x_bins and computes the cumulative sum over them.
