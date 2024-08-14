@@ -55,6 +55,7 @@ def count_variants_by_group(
     freq_meta_expr: Optional[hl.expr.ArrayExpression] = None,
     count_singletons: bool = False,
     count_downsamplings: Tuple[str] = (),
+    downsamplings: Optional[List[int]] = None,
     additional_grouping: Tuple[str] = (),
     partition_hint: int = 100,
     omit_methylation: bool = False,
@@ -129,6 +130,8 @@ def count_variants_by_group(
         Default is False.
     :param count_downsamplings: Tuple of populations to use for downsampling counts.
         Default is ().
+    :param downsamplings: Optional List of integers specifying what downsampling
+        indices to obtain. Default is None, which will return all downsampling counts.
     :param additional_grouping: Additional features to group by. e.g. 'exome_coverage'.
         Default is ().
     :param partition_hint: Target number of partitions for aggregation. Default is 100.
@@ -204,7 +207,11 @@ def count_variants_by_group(
             pop,
         )
         agg[f"downsampling_counts_{pop}"] = downsampling_counts_expr(
-            freq_expr, freq_meta_expr, pop, max_af=max_af
+            freq_expr,
+            freq_meta_expr,
+            pop,
+            max_af=max_af,
+            downsamplings=downsamplings,
         )
         if count_singletons:
             logger.info(
@@ -214,7 +221,12 @@ def count_variants_by_group(
                 pop,
             )
             agg[f"singleton_downsampling_counts_{pop}"] = downsampling_counts_expr(
-                freq_expr, freq_meta_expr, pop, singleton=True
+                freq_expr,
+                freq_meta_expr,
+                pop,
+                max_af=max_af,
+                downsamplings=downsamplings,
+                singleton=True,
             )
     # Apply each variant count aggregation in `agg` to get counts for all
     # combinations of `grouping`.
@@ -230,23 +242,55 @@ def get_downsampling_freq_indices(
     freq_meta_expr: hl.expr.ArrayExpression,
     pop: str = "global",
     variant_quality: str = "adj",
+    genetic_ancestry_label: Optional[str] = None,
+    subset: Optional[str] = None,
+    downsamplings: Optional[List[int]] = None,
 ) -> hl.expr.ArrayExpression:
     """
-    Get indices of dictionaries in meta dictionaries that only have the "downsampling" key with specified "pop" and "variant_quality" values.
+    Get indices of dictionaries in meta dictionaries that only have the "downsampling" key with specified `genetic_ancestry_label` and "variant_quality" values.
 
     :param freq_meta_expr: ArrayExpression containing the set of groupings for each
         element of the `freq_expr` array (e.g., [{'group': 'adj'}, {'group': 'adj',
         'pop': 'nfe'}, {'downsampling': '5000', 'group': 'adj', 'pop': 'global'}]).
-    :param pop: Population to use for filtering by the 'pop' key in `freq_meta_expr`.
-        Default is 'global'.
+    :param pop: Population to use for filtering by the `genetic_ancestry_label` key in
+        `freq_meta_expr`. Default is 'global'.
     :param variant_quality: Variant quality to use for filtering by the 'group' key in
         `freq_meta_expr`. Default is 'adj'.
+    :param genetic_ancestry_label: Label defining the genetic ancestry groups. If None,
+        "gen_anc" or "pop" is used (in that order of preference) if present. Default is
+        None.
+    :param subset: Subset to use for filtering by the 'subset' key in `freq_meta_expr`.
+        Default is None, which will return all downsampling indices without a 'subset'
+        key in `freq_meta_expr`.
+    :param downsamplings: Optional List of integers specifying what downsampling
+        indices to obtain. Default is None, which will return all downsampling indices.
+    :return: ArrayExpression of indices of dictionaries in `freq_meta_expr` that only
+        have the "downsampling" key with specified `genetic_ancestry_label` and
+        "variant_quality" values.
     """
-    indices = hl.enumerate(freq_meta_expr).filter(
-        lambda f: (f[1].get("group") == variant_quality)
-        & (f[1].get("pop") == pop)
-        & f[1].contains("downsampling")
-    )
+    if genetic_ancestry_label is None:
+        gen_anc = ["gen_anc", "pop"]
+    else:
+        gen_anc = [genetic_ancestry_label]
+
+    def _get_filter_expr(m: hl.expr.StructExpression) -> hl.expr.BooleanExpression:
+        filter_expr = (
+            (m.get("group") == variant_quality)
+            & (hl.any([m.get(l, "") == pop for l in gen_anc]))
+            & m.contains("downsampling")
+        )
+        if downsamplings is not None:
+            filter_expr &= hl.literal(downsamplings).contains(
+                hl.int(m.get("downsampling", "0"))
+            )
+        if subset is None:
+            filter_expr &= ~m.contains("subset")
+        else:
+            filter_expr &= m.get("subset", "") == subset
+        return filter_expr
+
+    indices = hl.enumerate(freq_meta_expr).filter(lambda f: _get_filter_expr(f[1]))
+
     # Get an array of indices and meta dictionaries sorted by "downsampling" key.
     return hl.sorted(indices, key=lambda f: hl.int(f[1]["downsampling"]))
 
@@ -258,33 +302,50 @@ def downsampling_counts_expr(
     variant_quality: str = "adj",
     singleton: bool = False,
     max_af: Optional[float] = None,
+    genetic_ancestry_label: Optional[str] = None,
+    subset: Optional[str] = None,
+    downsamplings: Optional[List[int]] = None,
 ) -> hl.expr.ArrayExpression:
     """
     Return an aggregation expression to compute an array of counts of all downsamplings found in `freq_expr` where specified criteria is met.
 
     The frequency metadata (`freq_meta_expr`) should be in a similar format to the
     `freq_meta` annotation added by `annotate_freq()`. Each downsampling should have
-    'group', 'pop', and 'downsampling' keys. Included downsamplings are those where
-    'group' == `variant_quality` and 'pop' == `pop`.
+    'group', `genetic_ancestry_label`, and 'downsampling' keys. Included downsamplings
+    are those where 'group' == `variant_quality` and `genetic_ancestry_label` == `pop`.
 
     :param freq_expr: ArrayExpression of Structs with 'AC' and 'AF' annotations.
     :param freq_meta_expr: ArrayExpression containing the set of groupings for each
         element of the `freq_expr` array (e.g., [{'group': 'adj'}, {'group': 'adj',
         'pop': 'nfe'}, {'downsampling': '5000', 'group': 'adj', 'pop': 'global'}]).
-    :param pop: Population to use for filtering by the 'pop' key in `freq_meta_expr`.
-        Default is 'global'.
+    :param pop: Population to use for filtering by the `genetic_ancestry_label` key in
+        `freq_meta_expr`. Default is 'global'.
     :param variant_quality: Variant quality to use for filtering by the 'group' key in
         `freq_meta_expr`. Default is 'adj'.
     :param singleton: Whether to filter to only singletons before counting (AC == 1).
         Default is False.
     :param max_af: Maximum variant allele frequency to keep. By default no allele
         frequency cutoff is applied.
+    :param genetic_ancestry_label: Label defining the genetic ancestry groups. If None,
+        "gen_anc" or "pop" is used (in that order of preference) if present. Default is
+        None.
+    :param subset: Subset to use for filtering by the 'subset' key in `freq_meta_expr`.
+        Default is None, which will return all downsampling counts without a 'subset'
+        key in `freq_meta_expr`. If specified, only downsamplings with the specified
+        subset will be included.
+    :param downsamplings: Optional List of integers specifying what downsampling
+        indices to obtain. Default is None, which will return all downsampling counts.
     :return: Aggregation Expression for an array of the variant counts in downsamplings
         for specified population.
     """
     # Get an array of indices sorted by "downsampling" key.
     sorted_indices = get_downsampling_freq_indices(
-        freq_meta_expr, pop, variant_quality
+        freq_meta_expr,
+        pop,
+        variant_quality,
+        genetic_ancestry_label,
+        subset,
+        downsamplings,
     ).map(lambda x: x[0])
 
     def _get_criteria(i: hl.expr.Int32Expression) -> hl.expr.Int32Expression:
@@ -309,6 +370,48 @@ def downsampling_counts_expr(
     # `sorted_indices` meets the specified criteria.
     # Return an array sum aggregation that aggregates arrays generated from mapping.
     return hl.agg.array_sum(hl.map(_get_criteria, sorted_indices))
+
+
+def explode_downsamplings_oe(
+    ht: hl.Table,
+    downsampling_meta: Dict[str, List[str]],
+    metrics: List[str] = ["syn", "lof", "mis"],
+) -> hl.Table:
+    """
+    Explode observed and expected downsampling counts for each genetic ancestry group and metric.
+
+    The input `ht` must contain struct of downsampling information for genetic ancestry
+    groups under each metric name. For example: 'lof': struct {gen_anc_exp: struct
+    {global: array<float64>}.
+
+    :param ht: Input Table.
+    :param metrics: List of metrics to explode. Default is '['syn', 'lof', 'mis']'.
+    :param downsampling_meta: Dictionary containing downsampling metadata. Keys are the
+        genetic ancestry group names and values are the list of downsamplings for that
+        genetic ancestry group. Example: {'global': ['5000', '10000'], 'afr': ['5000',
+        '10000']}.
+    :return: Table with downsampling counts exploded so that observed and expected
+        metric counts for each pair of genetic ancestry groups and downsamplings is a
+        separate row.
+    """
+    ht = ht.select(
+        _data=[
+            hl.struct(
+                gen_anc=pop,
+                downsampling=downsampling,
+                **{
+                    f"{metric}.{oe}": ht[metric][f"gen_anc_{oe}"][pop][i]
+                    for oe in ["obs", "exp"]
+                    for metric in metrics
+                },
+            )
+            for pop, downsamplings in downsampling_meta.items()
+            for i, downsampling in enumerate(downsamplings)
+        ]
+    )
+    ht = ht.explode("_data")
+    ht = ht.transmute(**ht._data)
+    return ht
 
 
 def annotate_mutation_type(
@@ -409,7 +512,7 @@ def annotate_mutation_type(
 
 
 def trimer_from_heptamer(
-    t: Union[hl.MatrixTable, hl.Table]
+    t: Union[hl.MatrixTable, hl.Table],
 ) -> Union[hl.MatrixTable, hl.Table]:
     """
     Trim heptamer context to create trimer context.
@@ -426,7 +529,7 @@ def trimer_from_heptamer(
 
 
 def collapse_strand(
-    t: Union[hl.Table, hl.MatrixTable]
+    t: Union[hl.Table, hl.MatrixTable],
 ) -> Union[hl.Table, hl.MatrixTable]:
     """
     Return the deduplicated context by collapsing DNA strands.
@@ -790,6 +893,8 @@ def get_constraint_grouping_expr(
             `include_transcript_group` is True)
         - canonical from `vep_annotation_expr` (added when `include_canonical_group` is
             True)
+        - mane_select from `vep_annotation_expr` (added when `include_mane_select_group` is
+            True)
 
     .. note::
         This function expects that the following fields are present in
@@ -800,6 +905,7 @@ def get_constraint_grouping_expr(
         - gene_symbol
         - transcript_id (if `include_transcript_group` is True)
         - canonical (if `include_canonical_group` is True)
+        - mane_select (if `include_mane_select_group` is True)
 
     :param vep_annotation_expr: StructExpression of VEP annotation.
     :param coverage_expr: Optional Int32Expression of exome coverage. Default is None.
@@ -859,6 +965,8 @@ def annotate_exploded_vep_for_constraint_groupings(
         - transcript - id from 'transcript_id' in `vep_annotation` (added when
             `include_transcript_group` is True)
         - canonical from `vep_annotation` (added when `include_canonical_group` is
+            True)
+        - mane_select from `vep_annotation` (added when `include_mane_select_group` is
             True)
 
     .. note::
@@ -929,7 +1037,7 @@ def compute_expected_variants(
     :param plateau_models_expr: Linear models (output of `build_models()`, with the values
         of the dictionary formatted as a StructExpression of intercept and slope, that
         calibrates mutation rate to proportion observed for high coverage exomes. It
-        includes models for CpG, non-CpG sites, and each population in `POPS`.
+        includes models for CpG, non-CpG sites, and each population if specified.
     :param mu_expr: Float64Expression of mutation rate.
     :param possible_variants_expr: Int64Expression of possible variant counts.
     :param cov_corr_expr: Float64Expression of corrected coverage expression.
@@ -996,9 +1104,9 @@ def oe_aggregation_expr(
         - oe - observed:expected ratio of variants filtered to `filter_expr`.
 
         If `pops` is specified:
-            - pop_exp - Struct with the expected number of variants per population (for
+            - gen_anc_exp - Struct with the expected number of variants per population (for
               all pop in `pops`) filtered to `filter_expr`.
-            - pop_obs - Struct with the observed number of variants per population (for
+            - gen_anc_obs - Struct with the observed number of variants per population (for
               all pop in `pops`) filtered to `filter_expr`.
 
     .. note::
@@ -1034,10 +1142,10 @@ def oe_aggregation_expr(
     # Create aggregators that sum the number of observed variants
     # and expected variants for each population if pops is specified.
     if pops:
-        agg_expr["pop_exp"] = hl.struct(
+        agg_expr["gen_anc_exp"] = hl.struct(
             **{pop: hl.agg.array_sum(ht[f"expected_variants_{pop}"]) for pop in pops}
         )
-        agg_expr["pop_obs"] = hl.struct(
+        agg_expr["gen_anc_obs"] = hl.struct(
             **{pop: hl.agg.array_sum(ht[f"downsampling_counts_{pop}"]) for pop in pops}
         )
 
@@ -1282,3 +1390,65 @@ def calculate_raw_z_score_sd(
         sd_expr = hl.agg.stats(raw_z_expr).stdev
 
     return hl.agg.filter(filter_expr, sd_expr)
+
+
+def add_gencode_transcript_annotations(
+    ht: hl.Table,
+    gencode_ht: hl.Table,
+    annotations: List[str] = ["level", "transcript_type"],
+) -> hl.Table:
+    """
+    Add GENCODE annotations to Table based on transcript id.
+
+    .. note::
+        Added annotations by default are:
+        - level
+        - transcript_type
+
+        Computed annotations are:
+        - chromosome
+        - cds_length
+        - num_coding_exons
+
+    :param ht: Input Table.
+    :param gencode_ht: Table with GENCODE annotations.
+    :param annotations: List of GENCODE annotations to add. Default is ["level", "transcript_type"].
+        Added annotations also become keys for the group by when computing "cds_length" and "num_coding_exons".
+    :return: Table with transcript annotations from GENCODE added.
+    """
+    gencode_ht = gencode_ht.annotate(
+        length=gencode_ht.interval.end.position
+        - gencode_ht.interval.start.position
+        + 1,
+        chromosome=gencode_ht.interval.start.contig,
+    )
+
+    # Obtain CDS annotations from GENCODE file and calculate CDS length and
+    # number of exons.
+    annotations_to_add = set(annotations + ["chromosome", "transcript_id", "length"])
+
+    gencode_cds = (
+        gencode_ht.filter(gencode_ht.feature == "CDS")
+        .select(*annotations_to_add)
+        .key_by("transcript_id")
+        .drop("interval")
+    )
+
+    annotations_to_add.remove("length")
+
+    gencode_cds = (
+        gencode_cds.group_by(*annotations_to_add)
+        .aggregate(
+            cds_length=hl.agg.sum(gencode_cds.length), num_coding_exons=hl.agg.count()
+        )
+        .key_by("transcript_id")
+    )
+
+    gencode_cds = gencode_cds.checkpoint(
+        new_temp_file(prefix="gencode_cds", extension="ht")
+    )
+
+    # Add GENCODE annotations to input Table.
+    ht = ht.annotate(**gencode_cds[ht.transcript])
+
+    return ht

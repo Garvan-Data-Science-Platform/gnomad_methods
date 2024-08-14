@@ -128,49 +128,51 @@ def combine_functions(
     return cond
 
 
-def filter_low_conf_regions(
-    mt: Union[hl.MatrixTable, hl.Table],
+def low_conf_regions_expr(
+    locus_expr: hl.expr.LocusExpression,
     filter_lcr: bool = True,
     filter_decoy: bool = True,
     filter_segdup: bool = True,
     filter_exome_low_coverage_regions: bool = False,
     filter_telomeres_and_centromeres: bool = False,
     high_conf_regions: Optional[List[str]] = None,
-) -> Union[hl.MatrixTable, hl.Table]:
+) -> hl.expr.BooleanExpression:
     """
-    Filter low-confidence regions.
+    Create an expression to filter low confidence regions.
 
-    :param mt: MatrixTable or Table to filter
+    :param locus_expr: Locus expression to use for filtering.
     :param filter_lcr: Whether to filter LCR regions
     :param filter_decoy: Whether to filter decoy regions
     :param filter_segdup: Whether to filter Segdup regions
     :param filter_exome_low_coverage_regions: Whether to filter exome low confidence regions
     :param filter_telomeres_and_centromeres: Whether to filter telomeres and centromeres
     :param high_conf_regions: Paths to set of high confidence regions to restrict to (union of regions)
-    :return: MatrixTable or Table with low confidence regions removed
+    :return: Bool expression of whether loci are not low confidence (TRUE) or low confidence (FALSE)
     """
-    build = get_reference_genome(mt.locus).name
+    build = get_reference_genome(locus_expr).name
     if build == "GRCh37":
         import gnomad.resources.grch37.reference_data as resources
     elif build == "GRCh38":
         import gnomad.resources.grch38.reference_data as resources
+    else:
+        raise ValueError(f"Unsupported reference genome build: {build}")
 
     criteria = []
     if filter_lcr:
         lcr = resources.lcr_intervals.ht()
-        criteria.append(hl.is_missing(lcr[mt.locus]))
+        criteria.append(hl.is_missing(lcr[locus_expr]))
 
     if filter_decoy:
         decoy = resources.decoy_intervals.ht()
-        criteria.append(hl.is_missing(decoy[mt.locus]))
+        criteria.append(hl.is_missing(decoy[locus_expr]))
 
     if filter_segdup:
         segdup = resources.seg_dup_intervals.ht()
-        criteria.append(hl.is_missing(segdup[mt.locus]))
+        criteria.append(hl.is_missing(segdup[locus_expr]))
 
     if filter_exome_low_coverage_regions:
         high_cov = resources.high_coverage_intervals.ht()
-        criteria.append(hl.is_missing(high_cov[mt.locus]))
+        criteria.append(hl.is_missing(high_cov[locus_expr]))
 
     if filter_telomeres_and_centromeres:
         if build != "GRCh38":
@@ -179,25 +181,42 @@ def filter_low_conf_regions(
             )
 
         telomeres_and_centromeres = resources.telomeres_and_centromeres.ht()
-        criteria.append(hl.is_missing(telomeres_and_centromeres[mt.locus]))
+        criteria.append(hl.is_missing(telomeres_and_centromeres[locus_expr]))
 
     if high_conf_regions is not None:
         for region in high_conf_regions:
             region = hl.import_locus_intervals(region)
-            criteria.append(hl.is_defined(region[mt.locus]))
+            criteria.append(hl.is_defined(region[locus_expr]))
 
     if criteria:
         filter_criteria = functools.reduce(operator.iand, criteria)
-        if isinstance(mt, hl.MatrixTable):
-            mt = mt.filter_rows(filter_criteria)
-        else:
-            mt = mt.filter(filter_criteria)
+        return filter_criteria
+    else:
+        raise ValueError("No low confidence regions requested for filtering.")
 
-    return mt
+
+def filter_low_conf_regions(
+    t: Union[hl.MatrixTable, hl.Table],
+    **kwargs,
+) -> Union[hl.MatrixTable, hl.Table]:
+    """
+    Filter low-confidence regions.
+
+    :param t: MatrixTable or Table to filter.
+    :param kwargs: Keyword arguments to pass to `low_conf_regions_expr`.
+    :return: MatrixTable or Table with low confidence regions removed.
+    """
+    filter_criteria = low_conf_regions_expr(t.locus, **kwargs)
+    if isinstance(t, hl.MatrixTable):
+        t = t.filter_rows(filter_criteria)
+    else:
+        t = t.filter(filter_criteria)
+
+    return t
 
 
 def filter_to_autosomes(
-    t: Union[hl.MatrixTable, hl.Table]
+    t: Union[hl.MatrixTable, hl.Table],
 ) -> Union[hl.MatrixTable, hl.Table]:
     """
     Filter the Table or MatrixTable to autosomes only.
@@ -383,6 +402,74 @@ def filter_to_clinvar_pathogenic(
     return t
 
 
+def filter_to_gencode_cds(
+    t: Union[hl.MatrixTable, hl.Table], gencode_ht: Optional[hl.Table] = None
+) -> hl.Table:
+    """
+    Filter a Table/MatrixTable to only Gencode CDS regions in protein coding transcripts.
+
+    Example use:
+
+    .. code-block:: python
+
+        from gnomad.resources.grch37.reference_data import gencode
+        gencode_ht = gencode.ht()
+        gencode_ht = filter_gencode_to_cds(gencode_ht)
+
+    .. note::
+
+        If no Gencode Table is provided, the default version of the Gencode Table
+        resource for the genome build of the input Table/MatrixTable will be used.
+
+    .. warning::
+
+        This Gencode CDS interval filter does not take into account the
+        transcript_id, it filters to any locus that is found in a CDS interval for
+        any protein coding transcript. Therefore, if downstream analyses require
+        filtering to CDS intervals by transcript, an additional step must be taken.
+        For example, when filtering VEP transcript consequences, there may be cases
+        where a variant is retained with this filter, but is considered outside the
+        CDS intervals of the transcript per the VEP predicted consequence of the
+        variant.
+
+    :param t: Input Table/MatrixTable to filter.
+    :param gencode_ht: Gencode Table to use for filtering the input Table/MatrixTable
+        to CDS regions. Default is None, which will use the default version of the
+        Gencode Table resource.
+    :return: Table/MatrixTable filtered to loci in Gencode CDS intervals.
+    """
+    if gencode_ht is None:
+        build = get_reference_genome(t.locus).name
+        if build == "GRCh37":
+            from gnomad.resources.grch37.reference_data import gencode
+        elif build == "GRCh38":
+            from gnomad.resources.grch38.reference_data import gencode
+        else:
+            raise ValueError(f"Unsupported reference genome build: {build}")
+
+        logger.info(
+            "No Gencode Table was supplied, using Gencode version %s",
+            gencode.default_version,
+        )
+        gencode_ht = gencode.ht()
+
+    gencode_ht = gencode_ht.filter(
+        (gencode_ht.feature == "CDS") & (gencode_ht.transcript_type == "protein_coding")
+    )
+    logger.warning(
+        "This Gencode CDS interval filter does not filter by transcript! Please see the"
+        " documentation for more details to confirm it's being used as intended."
+    )
+    filter_expr = hl.is_defined(gencode_ht[t.locus])
+
+    if isinstance(t, hl.MatrixTable):
+        t = t.filter_rows(filter_expr)
+    else:
+        t = t.filter(filter_expr)
+
+    return t
+
+
 def remove_fields_from_constant(
     constant: List[str], fields_to_remove: List[str]
 ) -> List[str]:
@@ -402,7 +489,7 @@ def remove_fields_from_constant(
 
 
 def filter_x_nonpar(
-    t: Union[hl.Table, hl.MatrixTable]
+    t: Union[hl.Table, hl.MatrixTable],
 ) -> Union[hl.Table, hl.MatrixTable]:
     """
     Filter to loci that are in non-PAR regions on chromosome X.
@@ -428,7 +515,7 @@ def filter_x_nonpar(
 
 
 def filter_y_nonpar(
-    t: Union[hl.Table, hl.MatrixTable]
+    t: Union[hl.Table, hl.MatrixTable],
 ) -> Union[hl.Table, hl.MatrixTable]:
     """
     Filter to loci that are in non-PAR regions on chromosome Y.
